@@ -1,12 +1,4 @@
-# ============================================================================
-# model.py — RobotMission simulation model
-# ============================================================================
-# Project : Robot Mission MAS 2026
-# Created : March 2026
-# Description: Sets up the grid, places radioactivity / waste / robots,
-#              implements the do() method that executes agent actions, and
-#              collects data for analysis.
-# ============================================================================
+
 
 import random
 from mesa import Model
@@ -24,6 +16,11 @@ from agents import (
     MOVE_NORTH, MOVE_SOUTH, MOVE_EAST, MOVE_WEST,
     PICK_UP, DROP, TRANSFORM, WAIT,
 )
+
+# ---------------------------------------------------------------------------
+# Stuck-robot watchdog threshold (steps at the same cell before intervention)
+# ---------------------------------------------------------------------------
+STUCK_THRESHOLD = 20
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +45,11 @@ def count_total_waste(model):
     return sum(1 for a in model.schedule.agents if isinstance(a, Waste))
 
 def count_messages_sent(model):
-    """Cumulative messages sent (for Step 2 communication metrics)."""
     return model.messages_sent
+
+def count_stuck_interventions(model):
+    """Total number of times the model intervened to un-stick a robot."""
+    return model.stuck_interventions
 
 
 # ============================================================================
@@ -67,6 +67,8 @@ class RobotMission(Model):
         Number of each robot type.
     n_initial_waste : int
         Number of green waste items placed randomly in zone z1 at start.
+    communication_enabled : bool
+        Whether the communication protocol is active.
     seed : int or None
         Random seed for reproducibility.
     """
@@ -93,9 +95,13 @@ class RobotMission(Model):
         self.communication_enabled = communication_enabled
 
         # Metrics
-        self.disposed_count = 0
-        self.messages_sent = 0
-        self.current_step = 0
+        self.disposed_count      = 0
+        self.messages_sent       = 0
+        self.current_step        = 0
+        self.stuck_interventions = 0   # how many times watchdog fired
+
+        # Stuck-robot tracking: uid → (last_pos, consecutive_stuck_steps)
+        self._robot_stuck_counter: dict = {}
 
         # Configure shared zone boundaries
         configure_zone_bounds(width)
@@ -115,12 +121,13 @@ class RobotMission(Model):
         # ---- 5. Data collector ----
         self.datacollector = DataCollector(
             model_reporters={
-                "Green waste":  count_green_waste,
-                "Yellow waste": count_yellow_waste,
-                "Red waste":    count_red_waste,
-                "Total waste":  count_total_waste,
-                "Disposed":     count_disposed,
-                "Messages":     count_messages_sent,
+                "Green waste":         count_green_waste,
+                "Yellow waste":        count_yellow_waste,
+                "Red waste":           count_red_waste,
+                "Total waste":         count_total_waste,
+                "Disposed":            count_disposed,
+                "Messages":            count_messages_sent,
+                "Stuck interventions": count_stuck_interventions,
             }
         )
 
@@ -148,7 +155,6 @@ class RobotMission(Model):
                     level = random.uniform(0.66, 1.0)
                 rad = Radioactivity(self._get_next_id(), self, zone, level)
                 self.grid.place_agent(rad, (x, y))
-                # Radioactivity agents don't need scheduling (no step)
 
     def _place_waste_disposal(self) -> tuple:
         """Place the WasteDisposal agent on a random cell in the easternmost column."""
@@ -166,7 +172,7 @@ class RobotMission(Model):
             y = random.randint(0, self.grid.height - 1)
             w = Waste(self._get_next_id(), self, "green")
             self.grid.place_agent(w, (x, y))
-            self.schedule.add(w)  # added so DataCollector can iterate
+            self.schedule.add(w)
 
     def _place_robots(self, n_green: int, n_yellow: int, n_red: int):
         """Create and place robots, setting their zone movement limits."""
@@ -179,20 +185,21 @@ class RobotMission(Model):
                 a = agent_cls(self._get_next_id(), self)
                 a.zone_x_min = x_min
                 a.zone_x_max = x_max
-                # Start inside allowed zone
                 sx = random.randint(start_zone_bounds[0], start_zone_bounds[1])
                 sy = random.randint(0, self.grid.height - 1)
                 self.grid.place_agent(a, (sx, sy))
+                # Init knowledge immediately so model can inject disposal pos
+                a._init_knowledge()
                 self.schedule.add(a)
 
-        # Green robots: restricted to z1
         place(GreenAgent, n_green, z1_lo, z1_hi, (z1_lo, z1_hi))
-
-        # Yellow robots: zones z1 + z2
         place(YellowAgent, n_yellow, z1_lo, z2_hi, (z1_lo, z2_hi))
-
-        # Red robots: all zones z1 + z2 + z3
         place(RedAgent, n_red, z1_lo, z3_hi, (z1_lo, z3_hi))
+
+        # Inject disposal pos into every red robot's knowledge right away.
+        # This avoids a cold-start where red robots wander east searching for
+        # the disposal zone instead of heading directly there.
+        self.broadcast_disposal_pos()
 
     # ==================================================================
     # Percepts — what the agent can "see" around it
@@ -201,15 +208,10 @@ class RobotMission(Model):
         """Return a dict mapping nearby positions to their visible contents.
 
         The agent sees its own cell plus the 4 cardinal neighbours.
-        Each entry is: { 'wastes': [list of waste types],
-                         'robots': [list of robot types],
-                         'zone': str,
-                         'radioactivity': float,
-                         'has_disposal': bool }
+        Each entry: { 'wastes', 'robots', 'zone', 'radioactivity', 'has_disposal' }
         """
         percepts = {}
         x, y = agent.pos
-        # Own cell + 4 neighbours
         positions = [(x, y)]
         for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
             nx, ny = x + dx, y + dy
@@ -218,25 +220,25 @@ class RobotMission(Model):
 
         for pos in positions:
             cell_agents = self.grid.get_cell_list_contents([pos])
-            wastes = [a.waste_type for a in cell_agents if isinstance(a, Waste)]
-            robots = [a.robot_type for a in cell_agents
-                      if isinstance(a, RobotAgent) and a is not agent]
-            zone = "z1"
-            rad_level = 0.0
+            wastes       = [a.waste_type  for a in cell_agents if isinstance(a, Waste)]
+            robots       = [a.robot_type  for a in cell_agents
+                            if isinstance(a, RobotAgent) and a is not agent]
+            zone         = "z1"
+            rad_level    = 0.0
             has_disposal = False
             for a in cell_agents:
                 if isinstance(a, Radioactivity):
-                    zone = a.zone
+                    zone      = a.zone
                     rad_level = a.level
                 if isinstance(a, WasteDisposal):
                     has_disposal = True
 
             percepts[pos] = {
-                "wastes": wastes,
-                "robots": robots,
-                "zone": zone,
+                "wastes":        wastes,
+                "robots":        robots,
+                "zone":          zone,
                 "radioactivity": rad_level,
-                "has_disposal": has_disposal,
+                "has_disposal":  has_disposal,
             }
         return percepts
 
@@ -244,82 +246,84 @@ class RobotMission(Model):
     # do() — execute an agent's chosen action
     # ==================================================================
     def do(self, agent: RobotAgent, action: str) -> dict:
-        """Validate and execute *action* for *agent*, return new percepts.
-
-        The model is the authority: even if the agent *thinks* an action is
-        valid, the model may reject it (e.g. moving outside allowed zone).
-        """
-
+        """Validate and execute *action* for *agent*, return new percepts."""
         if action in MOVE_ACTIONS:
             self._do_move(agent, action)
-
         elif action == PICK_UP:
             self._do_pick_up(agent)
-
         elif action == DROP:
             self._do_drop(agent)
-
         elif action == TRANSFORM:
             self._do_transform(agent)
-
         elif action == WAIT:
-            pass  # do nothing
+            pass
 
-        # Return fresh percepts after the action
         return self.get_percepts(agent)
 
     # ------------------------------------------------------------------
     # Action implementations
     # ------------------------------------------------------------------
     def _do_move(self, agent: RobotAgent, action: str):
-        """Move the agent one cell in the given direction if feasible."""
         dx, dy = DIRECTION_DELTAS[action]
         new_x = agent.pos[0] + dx
         new_y = agent.pos[1] + dy
 
-        # Check grid boundaries
         if not (0 <= new_x < self.grid.width and 0 <= new_y < self.grid.height):
-            return  # blocked by wall
-
-        # Check zone restrictions
+            return
         if not (agent.zone_x_min <= new_x <= agent.zone_x_max):
-            return  # not allowed in that zone
+            return
 
         self.grid.move_agent(agent, (new_x, new_y))
 
     def _do_pick_up(self, agent: RobotAgent):
-        """Pick up one waste of the type this robot collects, if present."""
         if len(agent.inventory) >= agent.max_inventory:
-            return  # inventory full
+            return
 
         cell_agents = self.grid.get_cell_list_contents([agent.pos])
         for a in cell_agents:
             if isinstance(a, Waste) and a.waste_type == agent.collects:
-                # Remove waste from grid and schedule
                 agent.inventory.append(a.waste_type)
                 self.grid.remove_agent(a)
                 self.schedule.remove(a)
-                return  # pick up one at a time
+                return
 
     def _do_drop(self, agent: RobotAgent):
-        """Drop the transformed/collected waste at the current position.
+        """Drop waste at current position.
 
-        Green robot drops yellow waste; yellow drops red; red drops at disposal.
+        Red robot fix: instead of a strict equality check against a single
+        stored disposal_pos (which could be stale in the agent's knowledge),
+        the model checks whether the current cell actually contains a
+        WasteDisposal object.  This makes the drop immune to knowledge
+        desync and works correctly even if we later add multiple disposal
+        zones.
+
+        Green / yellow robots drop their transformed waste anywhere — the
+        model places a new Waste object at their current cell.
         """
         if not agent.inventory:
             return
 
         if agent.robot_type == "red":
-            # Red robot must be at disposal zone
-            if agent.pos != self.disposal_pos:
+            # Authoritative check: does THIS cell have a disposal zone?
+            cell_agents = self.grid.get_cell_list_contents([agent.pos])
+            at_disposal = any(isinstance(a, WasteDisposal) for a in cell_agents)
+            if not at_disposal:
                 return
             if "red" in agent.inventory:
                 agent.inventory.remove("red")
                 self.disposed_count += 1
-                return
+                # Correct agent knowledge in case it stored a wrong disposal pos
+                if agent.knowledge:
+                    agent.knowledge["waste_disposal_pos"] = agent.pos
+            return
 
-        # Green/yellow robots drop their transformed waste
-        drop_type = agent.transform_to  # yellow for green-robot, red for yellow-robot
+        # Green / yellow: prefer dropping transformed waste.
+        # Fallback: drop collected‑type waste (orphan recombination).
+        drop_type = agent.transform_to
+        if not (drop_type and drop_type in agent.inventory):
+            # No transformed waste to drop → try orphan drop (collected type)
+            drop_type = agent.collects if agent.collects in agent.inventory else None
+
         if drop_type and drop_type in agent.inventory:
             agent.inventory.remove(drop_type)
             new_waste = Waste(self._get_next_id(), self, drop_type)
@@ -327,21 +331,14 @@ class RobotMission(Model):
             self.schedule.add(new_waste)
 
     def _do_transform(self, agent: RobotAgent):
-        """Transform collected waste into the next tier.
-
-        Green: 2 green → 1 yellow (stays in inventory)
-        Yellow: 2 yellow → 1 red (stays in inventory)
-        Red: no transform ability.
-        """
         if agent.transform_to is None:
-            return  # red robots can't transform
+            return
 
-        source = agent.collects  # "green" for green-robot, etc.
-        count = sum(1 for w in agent.inventory if w == source)
+        source = agent.collects
+        count  = sum(1 for w in agent.inventory if w == source)
         if count < 2:
-            return  # not enough waste to transform
+            return
 
-        # Remove 2 source wastes, add 1 transformed waste
         removed = 0
         new_inv = []
         for w in agent.inventory:
@@ -353,27 +350,99 @@ class RobotMission(Model):
         agent.inventory = new_inv
 
     # ==================================================================
-    # Communication support (Step 2)
+    # Communication support
     # ==================================================================
     def send_message(self, sender: RobotAgent, receiver: RobotAgent, message: dict):
-        """Deliver a message from sender to receiver's inbox.
-
-        Messages are dictionaries — their structure is up to the agents.
-        Example: {'type': 'waste_found', 'waste_type': 'yellow', 'pos': (5, 3)}
-        """
         receiver.inbox.append({
-            "from": sender.unique_id,
+            "from":      sender.unique_id,
             "from_type": sender.robot_type,
-            "content": message,
+            "content":   message,
         })
         self.messages_sent += 1
 
     def broadcast_message(self, sender: RobotAgent, message: dict, target_type: str = None):
-        """Send a message to all robots (optionally filtered by type)."""
         for a in self.schedule.agents:
             if isinstance(a, RobotAgent) and a is not sender:
                 if target_type is None or a.robot_type == target_type:
                     self.send_message(sender, a, message)
+
+    def broadcast_disposal_pos(self):
+        """Inject the disposal position directly into every red robot's knowledge.
+
+        Called once after all robots are placed so red robots start with the
+        correct target even before they explore the grid.  This eliminates
+        the 'blind search for disposal zone' problem entirely: red robots
+        head straight for the known disposal cell as soon as they pick up
+        red waste, instead of wandering east and then scanning north/south.
+
+        The knowledge injection is done by the model (not via messages) to
+        avoid burning message budget on a one-time setup fact.
+        """
+        for a in self.schedule.agents:
+            if isinstance(a, RedAgent) and a.knowledge:
+                a.knowledge["waste_disposal_pos"] = self.disposal_pos
+
+    # ==================================================================
+    # Stuck-robot watchdog
+    # ==================================================================
+    def _check_stuck_robots(self):
+        """Detect and un-stick robots that haven't moved for STUCK_THRESHOLD steps.
+
+        For each robot agent the model tracks (last_position, consecutive_stuck_steps).
+        If a robot has been at the same cell for STUCK_THRESHOLD consecutive steps:
+
+          1. Reset scan state (scan_row = None, flip scan_dir, clear pos_history)
+             so the agent picks a fresh sweep direction next deliberation cycle.
+          2. Clear the stale waste entry for the robot's current cell — the robot
+             may be trying to pick up waste that was already collected by a
+             teammate (knowledge not yet updated).
+          3. Clear current_target so the robot doesn't keep navigating toward a
+             stale target.
+          4. Increment stuck_interventions counter (tracked in datacollector).
+
+        The threshold is deliberately high (20 steps) so the watchdog only fires
+        on genuine deadlocks, not on legitimate pauses (e.g. a robot waiting to
+        pick up a second piece of waste).
+        """
+        for agent in self.schedule.agents:
+            if not isinstance(agent, RobotAgent):
+                continue
+
+            uid = agent.unique_id
+            last_pos, stuck_count = self._robot_stuck_counter.get(uid, (None, 0))
+
+            if agent.pos == last_pos:
+                stuck_count += 1
+            else:
+                stuck_count = 0
+
+            self._robot_stuck_counter[uid] = (agent.pos, stuck_count)
+
+            if stuck_count < STUCK_THRESHOLD:
+                continue
+
+            # ---- Intervention ----
+            self.stuck_interventions += 1
+            self._robot_stuck_counter[uid] = (agent.pos, 0)  # reset counter
+
+            k = agent.knowledge
+            if not k:
+                continue
+
+            # 1. Flip sweep directions so robot takes a new exploration path
+            k["scan_dir_x"] = -k.get("scan_dir_x", 1)
+            k["scan_dir_y"] = -k.get("scan_dir_y", 1)
+            k["pos_history"] = []
+
+            # 2. Clear stale waste entries near current cell
+            stale = [p for p in k.get("known_waste", {})
+                     if abs(p[0] - agent.pos[0]) + abs(p[1] - agent.pos[1]) <= 3]
+            for p in stale:
+                k["known_waste"].pop(p, None)
+
+            # 3. For red robots carrying waste: re-inject the correct disposal pos
+            if agent.robot_type == "red" and "red" in agent.inventory:
+                k["waste_disposal_pos"] = self.disposal_pos
 
     # ==================================================================
     # Model step
@@ -384,7 +453,59 @@ class RobotMission(Model):
         self.schedule.step()
         self.current_step += 1
 
-        # Optional: stop when all waste is disposed
-        total = count_total_waste(self)
-        if total == 0:
-            self.running = False
+        # Stuck-robot watchdog — runs every step, O(n_robots)
+        self._check_stuck_robots()
+
+        # Stop when all waste is gone AND no robot is still carrying items
+        if count_total_waste(self) == 0:
+            any_inv = any(a.inventory for a in self.schedule.agents
+                         if isinstance(a, RobotAgent))
+            if not any_inv:
+                self.running = False
+                return
+
+        # Deadlock detection: delayed start (step 100) and coarse interval
+        # (every 50 steps) so robots have time to drop orphan items at the
+        # border for recombination before the model gives up.
+        if self.current_step >= 100 and self.current_step % 50 == 0:
+            if self._is_deadlocked():
+                self.running = False
+
+    def _is_deadlocked(self) -> bool:
+        """Return True if no more waste can ever be disposed.
+
+        Uses the 'effective yellow' formula:
+          effective_yellow = total_yellow + floor(total_green / 2)
+
+        This is the maximum yellow waste reachable from the current pipeline.
+        If effective_yellow < 2 AND total_red == 0, no more red can ever be
+        produced → no more disposal is possible → deadlock.
+
+        Examples:
+          green=1, yellow=0, red=0 → effective_yellow=0 → deadlock
+          green=0, yellow=1, red=0 → effective_yellow=1 → deadlock
+          green=2, yellow=1, red=0 → effective_yellow=2 → can still dispose
+          green=0, yellow=0, red=1 → can still dispose (red robot heads to disposal)
+        """
+        on_grid: dict = {"green": 0, "yellow": 0, "red": 0}
+        for a in self.schedule.agents:
+            if isinstance(a, Waste):
+                on_grid[a.waste_type] += 1
+
+        in_inv: dict = {"green": 0, "yellow": 0, "red": 0}
+        for a in self.schedule.agents:
+            if isinstance(a, RobotAgent):
+                for w in a.inventory:
+                    in_inv[w] += 1
+
+        total_green  = on_grid["green"]  + in_inv["green"]
+        total_yellow = on_grid["yellow"] + in_inv["yellow"]
+        total_red    = on_grid["red"]    + in_inv["red"]
+
+        # Nothing left anywhere → truly done (stop condition handles this too)
+        if total_green + total_yellow + total_red == 0:
+            return True
+
+        effective_yellow = total_yellow + (total_green // 2)
+        can_dispose = total_red > 0 or effective_yellow >= 2
+        return not can_dispose

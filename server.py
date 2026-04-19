@@ -129,6 +129,7 @@ model_params = {
     "n_yellow": Slider("Yellow robots", 3, 1, 10, 1),
     "n_red":    Slider("Red robots",    2, 1, 10, 1),
     "n_initial_waste": Slider("Initial green waste", 15, 5, 50, 1),
+    "n_disposal": Slider("Number of disposal zones", 3, 1, 10, 1),
     "communication_enabled": Checkbox("Communication enabled", value=True),
 }
 

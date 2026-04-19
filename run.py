@@ -44,7 +44,7 @@ def run_headless(steps: int = 500, seed: int = 42, communication: bool = True):
             print(f"  All waste disposed at step {i + 1}!")
             break
 
-    df = model.datacollector.get_model_dataframe()
+    df = model.datacollector.get_model_vars_dataframe()
     print(f"  Final: disposed={model.disposed_count}, "
           f"remaining={df['Total waste'].iloc[-1]}, "
           f"messages={model.messages_sent}")
