@@ -36,7 +36,7 @@ I added a `known_waste` dictionary to each robot's knowledge. Every time a robot
 This was the single most impactful optimisation. I implemented a broadcast communication protocol:
 
 - Every robot shares waste positions visible in its percepts with robots that collect that waste type
-- When a green robot drops yellow waste at the Zone 1 border, it sends a **targeted message** to all yellow robots with the exact drop position
+- When a green robot drops yellow waste at the Zone 1 border, it sends a **targeted message** to all yellow robots with the exact position
 - Yellow robots do the same for red robots when dropping red waste at the Zone 2 border
 
 This creates a directed information flow that mirrors the waste pipeline: green robots inform yellow robots, yellow robots inform red robots.
@@ -65,34 +65,72 @@ I also fixed the model to support this:
 
 ## Results
 
-### Performance Across Configurations (10 runs each, averaged)
+### Waste Processing Over Time
 
-| Configuration | Avg Steps | Avg Disposed | Max Theoretically Possible | Disposal Rate |
-|---|---|---|---|---|
-| 3 Green, 3 Yellow, 2 Red — 15 waste | **220** | 3.0 | 3 | **100%** |
-| 4 Green, 3 Yellow, 2 Red — 25 waste | **330** | 6.0 | 6 | **100%** |
-| 5 Green, 4 Yellow, 3 Red — 27 waste | **240** | 6.0 | 6 | **100%** |
+The following plot shows how waste is processed through the pipeline in a single run (25 initial green waste, communication enabled). The green line drops steadily as green robots pick up and transform waste, while the purple "Disposed" line climbs as red waste reaches the disposal zone.
 
-The system consistently achieves a **100% disposal rate** — every piece of waste that can theoretically be processed through the pipeline is processed. The only items remaining at the end are mathematically unresolvable odd-count leftovers (e.g., 1 green that cannot pair up).
+![Waste Processing Over Time](plots/waste_over_time.png)
 
-### Impact of Communication (4G 3Y 2R, 25 waste, 10 runs)
+**Observation:** The pipeline operates in clear phases. Green waste is consumed rapidly in the first ~60 steps. Yellow and red waste appear briefly as intermediate products before being processed further. The final disposed count reaches 6 (the theoretical maximum for 25 green waste: 25 → 12 yellow → 6 red → 6 disposed).
+
+---
+
+### Communication vs No-Communication
+
+This was the key comparison I wanted to make. I ran 10 simulations with each setting (same seeds) to measure the impact of inter-robot communication.
+
+![Communication Impact](plots/comms_comparison.png)
 
 | Mode | Avg Steps | Avg Disposed | Disposal Rate |
 |---|---|---|---|
 | Without Communication | **645** | 5.7 | 95% |
 | With Communication | **330** | 6.0 | 100% |
 
-### Interpretation
+**Interpretation:**
+- Communication cuts steps nearly **in half** (645 → 330), a direct 49% energy saving
+- Without communication, 3 out of 10 runs fail to dispose all possible waste (95% rate). With communication, every run achieves the theoretical maximum (100% rate)
+- The cost of communication is ~800 messages per run, which is negligible compared to the energy saved by 315 fewer movement steps
 
-1. **Communication cuts steps nearly in half** (645 → 330). Without communication, robots rely solely on their 5-cell visual range and random exploration to discover waste. With communication, a robot that spots waste immediately tells the relevant robot type exactly where it is — no searching required.
+---
 
-2. **Disposal rate improves from 95% to 100%**. Without communication, some runs (3 out of 10) fail to process all possible waste before the deadlock detector fires. With communication, every single run achieves the theoretical maximum.
+### Per-Run Step Comparison
 
-3. **Energy interpretation**: The ~315 fewer steps per run with communication represents a direct energy saving. Each step involves movement, scanning, or processing — all of which consume energy. A 49% reduction in steps means 49% less energy consumed for the same cleanup result.
+The scatter plot below shows how each individual run performed. The green dots (with communication) are consistently below the red dots (without communication), and the variance is also lower.
 
-4. **The remaining iteration count (200–350 steps) represents a hard lower bound** imposed by the physics of the simulation: robots can only move 1 cell per step, the grid is 30 cells wide, and each transformation requires multiple pick-up and drop actions. The pipeline depth (green → yellow → red → disposal) means waste must traverse the full grid width plus multiple transformation cycles.
+![Steps Per Run](plots/steps_per_run.png)
 
-5. **Occasional outlier runs** (600–750 steps) occur when green waste is clustered far from the zone border or when orphan waste requires the full detection + drop + re-pickup cycle, adding ~40–60 extra steps.
+**Observation:** Without communication, three runs hit the 1000-step ceiling (seeds 3, 8, 10), meaning they didn't finish at all. With communication, the worst case is ~750 steps and most runs complete in 150–350 steps.
+
+---
+
+### Waste Timeline: Side-by-Side Comparison
+
+Same seed (99), same waste layout — the only difference is whether communication is enabled. The contrast is striking.
+
+![Timeline Comparison](plots/timeline_comparison.png)
+
+**Left (No Communication):** Green waste is consumed slowly over ~250 steps. The pipeline is sluggish because yellow and red robots spend most of their time searching for waste they don't know about.
+
+**Right (With Communication):** Green waste is consumed in ~80 steps. As soon as green robots drop yellow waste, yellow robots receive a message and go directly to pick it up. The entire pipeline completes in ~200 steps — almost half the time.
+
+---
+
+### Scalability Across Configurations
+
+I tested three different configurations to see how the system scales with more robots and waste.
+
+![Scalability](plots/scalability.png)
+
+| Configuration | Avg Steps | Avg Disposed | Disposal Rate |
+|---|---|---|---|
+| 3 Green, 3 Yellow, 2 Red — 15 waste | **220** | 3.0 | **100%** |
+| 4 Green, 3 Yellow, 2 Red — 25 waste | **330** | 6.0 | **100%** |
+| 5 Green, 4 Yellow, 3 Red — 27 waste | **240** | 6.0 | **100%** |
+
+**Interpretation:**
+- The system consistently achieves **100% disposal rate** across all configurations
+- Adding more robots (5G 4Y 3R) for 27 waste actually completes faster (240 steps) than 4G 3Y 2R for 25 waste (330 steps), showing that the agent strategies scale well with additional parallelism
+- The only items remaining at the end of any run are mathematically unresolvable odd-count leftovers (e.g., 1 green that cannot form a pair)
 
 ---
 
@@ -107,6 +145,9 @@ python run.py --mode headless --steps 500
 
 # Compare communication vs no-communication
 python run.py --mode compare --runs 10
+
+# Generate all plots for the report
+python generate_plots.py
 ```
 
-**Requirements:** Python 3.10+, Mesa (`pip install mesa`)
+**Requirements:** Python 3.10+, Mesa (`pip install mesa`), Matplotlib (`pip install matplotlib`)
