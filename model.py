@@ -79,10 +79,6 @@ class RobotMission(Model):
         n_yellow: int = 3,
         n_red: int = 2,
         n_initial_waste: int = 15,
-<<<<<<< HEAD
-=======
-        n_disposal: int = 3,
->>>>>>> 28af64b (check)
         communication_enabled: bool = True,
         seed=None,
     ):
@@ -108,11 +104,7 @@ class RobotMission(Model):
         self._place_radioactivity()
 
         # ---- 2. Place waste disposal zone (eastern edge) ----
-<<<<<<< HEAD
         self.disposal_pos = self._place_waste_disposal()
-=======
-        self.disposal_positions = self._place_waste_disposal(n_disposal)
->>>>>>> 28af64b (check)
 
         # ---- 3. Place initial green waste in zone z1 ----
         self._place_initial_waste(n_initial_waste)
@@ -158,7 +150,6 @@ class RobotMission(Model):
                 self.grid.place_agent(rad, (x, y))
                 # Radioactivity agents don't need scheduling (no step)
 
-<<<<<<< HEAD
     def _place_waste_disposal(self) -> tuple:
         """Place the WasteDisposal agent on a random cell in the easternmost column."""
         east_x = self.grid.width - 1
@@ -166,18 +157,6 @@ class RobotMission(Model):
         wd = WasteDisposal(self._get_next_id(), self)
         self.grid.place_agent(wd, (east_x, y))
         return (east_x, y)
-=======
-
-    def _place_waste_disposal(self, n: int = 3):
-        east_x = self.grid.width - 1
-        ys = random.sample(range(self.grid.height), min(n, self.grid.height))
-        positions = []
-        for y in ys:
-            wd = WasteDisposal(self._get_next_id(), self)
-            self.grid.place_agent(wd, (east_x, y))
-            positions.append((east_x, y))
-        return positions
->>>>>>> 28af64b (check)
 
     def _place_initial_waste(self, n: int):
         """Place n green waste items randomly in zone z1."""
@@ -332,11 +311,7 @@ class RobotMission(Model):
 
         if agent.robot_type == "red":
             # Red robot must be at disposal zone
-<<<<<<< HEAD
             if agent.pos != self.disposal_pos:
-=======
-            if agent.pos not in self.disposal_positions:
->>>>>>> 28af64b (check)
                 return
             if "red" in agent.inventory:
                 agent.inventory.remove("red")
