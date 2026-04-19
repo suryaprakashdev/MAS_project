@@ -289,16 +289,6 @@ class RobotMission(Model):
 
     def _do_drop(self, agent: RobotAgent):
         """Drop waste at current position.
-
-        Red robot fix: instead of a strict equality check against a single
-        stored disposal_pos (which could be stale in the agent's knowledge),
-        the model checks whether the current cell actually contains a
-        WasteDisposal object.  This makes the drop immune to knowledge
-        desync and works correctly even if we later add multiple disposal
-        zones.
-
-        Green / yellow robots drop their transformed waste anywhere — the
-        model places a new Waste object at their current cell.
         """
         if not agent.inventory:
             return
@@ -367,17 +357,6 @@ class RobotMission(Model):
                     self.send_message(sender, a, message)
 
     def broadcast_disposal_pos(self):
-        """Inject the disposal position directly into every red robot's knowledge.
-
-        Called once after all robots are placed so red robots start with the
-        correct target even before they explore the grid.  This eliminates
-        the 'blind search for disposal zone' problem entirely: red robots
-        head straight for the known disposal cell as soon as they pick up
-        red waste, instead of wandering east and then scanning north/south.
-
-        The knowledge injection is done by the model (not via messages) to
-        avoid burning message budget on a one-time setup fact.
-        """
         for a in self.schedule.agents:
             if isinstance(a, RedAgent) and a.knowledge:
                 a.knowledge["waste_disposal_pos"] = self.disposal_pos
@@ -386,24 +365,6 @@ class RobotMission(Model):
     # Stuck-robot watchdog
     # ==================================================================
     def _check_stuck_robots(self):
-        """Detect and un-stick robots that haven't moved for STUCK_THRESHOLD steps.
-
-        For each robot agent the model tracks (last_position, consecutive_stuck_steps).
-        If a robot has been at the same cell for STUCK_THRESHOLD consecutive steps:
-
-          1. Reset scan state (scan_row = None, flip scan_dir, clear pos_history)
-             so the agent picks a fresh sweep direction next deliberation cycle.
-          2. Clear the stale waste entry for the robot's current cell — the robot
-             may be trying to pick up waste that was already collected by a
-             teammate (knowledge not yet updated).
-          3. Clear current_target so the robot doesn't keep navigating toward a
-             stale target.
-          4. Increment stuck_interventions counter (tracked in datacollector).
-
-        The threshold is deliberately high (20 steps) so the watchdog only fires
-        on genuine deadlocks, not on legitimate pauses (e.g. a robot waiting to
-        pick up a second piece of waste).
-        """
         for agent in self.schedule.agents:
             if not isinstance(agent, RobotAgent):
                 continue
@@ -472,21 +433,6 @@ class RobotMission(Model):
                 self.running = False
 
     def _is_deadlocked(self) -> bool:
-        """Return True if no more waste can ever be disposed.
-
-        Uses the 'effective yellow' formula:
-          effective_yellow = total_yellow + floor(total_green / 2)
-
-        This is the maximum yellow waste reachable from the current pipeline.
-        If effective_yellow < 2 AND total_red == 0, no more red can ever be
-        produced → no more disposal is possible → deadlock.
-
-        Examples:
-          green=1, yellow=0, red=0 → effective_yellow=0 → deadlock
-          green=0, yellow=1, red=0 → effective_yellow=1 → deadlock
-          green=2, yellow=1, red=0 → effective_yellow=2 → can still dispose
-          green=0, yellow=0, red=1 → can still dispose (red robot heads to disposal)
-        """
         on_grid: dict = {"green": 0, "yellow": 0, "red": 0}
         for a in self.schedule.agents:
             if isinstance(a, Waste):
